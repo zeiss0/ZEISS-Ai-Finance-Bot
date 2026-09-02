@@ -1,4 +1,4 @@
-# Contributing to YoloVest
+# Contributing to Bot
 
 Thanks for your interest in improving YoloVest. This is a personal, best-effort
 open-source project, so please read this guide before opening a pull request.

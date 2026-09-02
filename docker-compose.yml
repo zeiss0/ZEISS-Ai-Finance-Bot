@@ -1,0 +1,128 @@
+services:
+  nginx-proxy:
+    image: nginxproxy/nginx-proxy:1.10.1
+    container_name: nginx-proxy
+    restart: always
+    networks:
+      - yolovest
+    ports:
+      - "80:80"
+      - "443:443"
+    # Defensive symlink heal before nginx boots. Documented in
+    # docs/tls-recovery.md.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - /heal-cert-symlinks.sh && exec /app/docker-entrypoint.sh forego start -r
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - certs:/etc/nginx/certs
+      - vhost:/etc/nginx/vhost.d
+      - html:/usr/share/nginx/html
+      - ./nginx/custom.conf:/etc/nginx/conf.d/zz-custom.conf:ro
+      - ./nginx/heal-cert-symlinks.sh:/heal-cert-symlinks.sh:ro
+      - ./nginx/tls-healthcheck.sh:/tls-healthcheck.sh:ro
+    healthcheck:
+      test: ["CMD", "/tls-healthcheck.sh"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  letsencrypt:
+    image: nginxproxy/acme-companion:2.6.3
+    container_name: letsencrypt
+    restart: always
+    networks:
+      - yolovest
+    environment:
+      - NGINX_PROXY_CONTAINER=nginx-proxy
+    depends_on:
+      - nginx-proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - certs:/etc/nginx/certs
+      - vhost:/etc/nginx/vhost.d
+      - html:/usr/share/nginx/html
+
+  backend:
+    build: ./backend
+    container_name: yolovest-backend
+    restart: unless-stopped
+    networks:
+      - yolovest
+    expose:
+      - "8080"
+    volumes:
+      - ./backend/config.yaml:/app/config.yaml:ro
+      - yolovest-data:/app/data
+      - yolovest-backups:/app/backups
+      - yolovest-models:/app/models
+      - yolovest-logs:/app/logs
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Kolkata
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # First cold boot runs migrations, builds the broker / market-data /
+      # LLM stack, restores the Kite session, and warms the rate limiter
+      # before the FastAPI server binds. ML model deserialization
+      # (production + any accumulated shadow models) used to be in
+      # this critical path too but now runs in a background task. The
+      # generous start_period covers slow cold starts (e.g. swap
+      # fault-in under memory pressure) without slowing failure
+      # detection once the app is up.
+      start_period: 180s
+    # No baked-in resource limits — the app sizes its training workload via
+    # config (retraining.max_training_days etc.), not container caps. To cap
+    # memory/CPU for a specific deployment, add deploy.resources.limits in a
+    # docker-compose.override.yml.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  frontend:
+    build: ./frontend
+    container_name: yolovest-frontend
+    restart: unless-stopped
+    networks:
+      - yolovest
+    environment:
+      - VIRTUAL_HOST=${DOMAIN:-yolovest.example.com}
+      - LETSENCRYPT_HOST=${DOMAIN:-yolovest.example.com}
+      - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:-}
+    expose:
+      - "80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO /dev/null http://localhost:80/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+networks:
+  yolovest:
+    driver: bridge
+
+volumes:
+  certs:
+  vhost:
+  html:
+  yolovest-data:
+  yolovest-backups:
+  yolovest-models:
+  yolovest-logs:
